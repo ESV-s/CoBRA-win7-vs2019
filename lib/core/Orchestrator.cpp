@@ -1,0 +1,1456 @@
+#include "cobra/core/Evaluator.h"
+#include <optional>
+
+#include "Orchestrator.h"
+#include "OrchestratorPasses.h"
+#include "SemilinearPasses.h"
+#include "SignaturePasses.h"
+#include "SimplifierInternal.h"
+#include "cobra/core/AuxVarEliminator.h"
+#include "cobra/core/BitWidth.h"
+#include "cobra/core/DynamicMask.h"
+#include "cobra/core/ExprCost.h"
+#include "cobra/core/ExprUtils.h"
+#include "cobra/core/PatternMatcher.h"
+#include "cobra/core/Profile.h"
+#include "cobra/core/SignatureChecker.h"
+#include "cobra/core/SignatureEval.h"
+#include "cobra/core/SignatureSimplifier.h"
+#include "cobra/core/Simplifier.h"
+#include "cobra/core/SimplifyOutcome.h"
+#include "cobra/core/Trace.h"
+#include <tl/expected.hpp>
+
+
+#include <algorithm>
+#include <unordered_map>
+
+namespace cobra {
+
+    StateKind GetStateKind(const StateData &data) {
+        return std::visit(
+            []< typename T >(const T &) -> StateKind {
+                if constexpr (std::is_same_v< T, AstPayload >) {
+                    return StateKind::kFoldedAst;
+                } else if constexpr (std::is_same_v< T, SignatureStatePayload >) {
+                    return StateKind::kSignatureState;
+                } else if constexpr (std::is_same_v< T, SignatureCoeffStatePayload >) {
+                    return StateKind::kSignatureCoeffState;
+                } else if constexpr (std::is_same_v< T, CoreCandidatePayload >) {
+                    return StateKind::kCoreCandidate;
+                } else if constexpr (std::is_same_v< T, RemainderStatePayload >) {
+                    return StateKind::kRemainderState;
+                } else if constexpr (std::is_same_v< T, NormalizedSemilinearPayload >) {
+                    return StateKind::kSemilinearNormalizedIr;
+                } else if constexpr (std::is_same_v< T, CheckedSemilinearPayload >) {
+                    return StateKind::kSemilinearCheckedIr;
+                } else if constexpr (std::is_same_v< T, RewrittenSemilinearPayload >) {
+                    return StateKind::kSemilinearRewrittenIr;
+                } else if constexpr (std::is_same_v< T, LiftedSkeletonPayload >) {
+                    return StateKind::kLiftedSkeleton;
+                } else if constexpr (std::is_same_v< T, CompetitionResolvedPayload >) {
+                    return StateKind::kCompetitionResolved;
+                } else {
+                    return StateKind::kCandidateExpr;
+                }
+            },
+            data
+        );
+    }
+
+    StateFingerprint ComputeFingerprint(const WorkItem &item, uint32_t bitwidth) {
+        StateFingerprint fp;
+        fp.kind       = GetStateKind(item.payload);
+        fp.bitwidth   = bitwidth;
+        fp.provenance = item.features.provenance;
+
+        // Fold Phase 3 control state into signature-family hashes so
+        // the pass-attempt cache distinguishes subproblems that share
+        // the same signature but differ in group, recursion depth,
+        // or evaluator (residual-origin children).
+        auto fold_control = [&](size_t h) -> size_t {
+            h = detail::hash_combine(
+                h, std::hash< uint32_t >{}(item.group_id.value_or(UINT32_MAX))
+            );
+            h = detail::hash_combine(h, std::hash< uint8_t >{}(item.signature_recursion_depth));
+            h = detail::hash_combine(
+                h, std::hash< bool >{}(item.evaluator_override != nullptr)
+            );
+            return h;
+        };
+
+        std::visit(
+            [&fp, &fold_control, &item](const auto &payload) {
+                using T = std::decay_t< decltype(payload) >;
+                if constexpr (std::is_same_v< T, AstPayload >) {
+                    size_t h = std::hash< Expr >{}(*payload.expr);
+                    if (payload.solve_ctx.has_value()) {
+                        for (const auto &v : payload.solve_ctx->vars) {
+                            h = detail::hash_combine(h, std::hash< std::string >{}(v));
+                        }
+                        h = detail::hash_combine(
+                            h, std::hash< bool >{}(payload.solve_ctx->evaluator != nullptr)
+                        );
+                        for (uint64_t s : payload.solve_ctx->input_sig) {
+                            h = detail::hash_combine(h, std::hash< uint64_t >{}(s));
+                        }
+                    }
+                    h = detail::hash_combine(
+                        h, std::hash< uint32_t >{}(item.group_id.value_or(UINT32_MAX))
+                    );
+                    fp.payload_hash = h;
+                    fp.vars         = {};
+                } else if constexpr (std::is_same_v< T, SignatureStatePayload >) {
+                    size_t h = std::hash< size_t >{}(payload.ctx.sig.size());
+                    for (uint64_t v : payload.ctx.sig) {
+                        h = detail::hash_combine(h, std::hash< uint64_t >{}(v));
+                    }
+                    fp.payload_hash = fold_control(h);
+                    fp.vars         = payload.ctx.real_vars;
+                } else if constexpr (std::is_same_v< T, SignatureCoeffStatePayload >) {
+                    size_t h = std::hash< size_t >{}(payload.ctx.sig.size());
+                    for (uint64_t v : payload.ctx.sig) {
+                        h = detail::hash_combine(h, std::hash< uint64_t >{}(v));
+                    }
+                    for (uint64_t c : payload.coeffs) {
+                        h = detail::hash_combine(h, std::hash< uint64_t >{}(c));
+                    }
+                    fp.payload_hash = fold_control(h);
+                    fp.vars         = payload.ctx.real_vars;
+                } else if constexpr (std::is_same_v< T, CoreCandidatePayload >) {
+                    size_t h = std::hash< Expr >{}(*payload.core_expr);
+                    h        = detail::hash_combine(
+                        h,
+                        std::hash< uint8_t >{}(static_cast< uint8_t >(payload.extractor_kind))
+                    );
+                    h = detail::hash_combine(h, std::hash< uint8_t >{}(payload.degree_used));
+                    for (const auto &v : payload.target.vars) {
+                        h = detail::hash_combine(h, std::hash< std::string >{}(v));
+                    }
+                    for (uint32_t r : payload.target.remap_support) {
+                        h = detail::hash_combine(h, std::hash< uint32_t >{}(r));
+                    }
+                    fp.payload_hash = h;
+                    fp.vars         = {};
+                } else if constexpr (std::is_same_v< T, RemainderStatePayload >) {
+                    size_t h = std::hash< uint8_t >{}(static_cast< uint8_t >(payload.origin));
+                    if (payload.prefix_expr) {
+                        h = detail::hash_combine(h, std::hash< Expr >{}(*payload.prefix_expr));
+                    } else {
+                        h = detail::hash_combine(h, std::hash< uint64_t >{}(0xDEAD));
+                    }
+                    for (uint64_t v : payload.remainder_sig) {
+                        h = detail::hash_combine(h, std::hash< uint64_t >{}(v));
+                    }
+                    for (uint32_t s : payload.remainder_support) {
+                        h = detail::hash_combine(h, std::hash< uint32_t >{}(s));
+                    }
+                    h = detail::hash_combine(h, std::hash< bool >{}(payload.is_boolean_null));
+                    h = detail::hash_combine(h, std::hash< uint8_t >{}(payload.degree_floor));
+                    for (const auto &v : payload.target.vars) {
+                        h = detail::hash_combine(h, std::hash< std::string >{}(v));
+                    }
+                    for (uint32_t r : payload.target.remap_support) {
+                        h = detail::hash_combine(h, std::hash< uint32_t >{}(r));
+                    }
+                    h = detail::hash_combine(
+                        h, std::hash< uint32_t >{}(item.group_id.value_or(UINT32_MAX))
+                    );
+                    fp.payload_hash = h;
+                    fp.vars         = {};
+                } else if constexpr (
+                    std::is_same_v< T, NormalizedSemilinearPayload >
+                    || std::is_same_v< T, CheckedSemilinearPayload >
+                    || std::is_same_v< T, RewrittenSemilinearPayload >
+                )
+                {
+                    auto key        = BuildSemilinearFingerprintKey(payload.ctx.ir);
+                    fp.payload_hash = std::hash< SemilinearFingerprintKey >{}(key);
+                    fp.vars         = {};
+                } else if constexpr (std::is_same_v< T, LiftedSkeletonPayload >) {
+                    size_t h = std::hash< Expr >{}(*payload.outer_expr);
+                    for (const auto &v : payload.outer_ctx.vars) {
+                        h = detail::hash_combine(h, std::hash< std::string >{}(v));
+                    }
+                    for (uint64_t s : payload.outer_ctx.input_sig) {
+                        h = detail::hash_combine(h, std::hash< uint64_t >{}(s));
+                    }
+                    for (const auto &v : payload.original_ctx.vars) {
+                        h = detail::hash_combine(h, std::hash< std::string >{}(v));
+                    }
+                    h = detail::hash_combine(
+                        h, std::hash< bool >{}(payload.original_ctx.evaluator != nullptr)
+                    );
+                    h = detail::hash_combine(
+                        h, std::hash< uint32_t >{}(payload.original_var_count)
+                    );
+                    for (const auto &b : payload.bindings) {
+                        h = detail::hash_combine(
+                            h, std::hash< uint8_t >{}(static_cast< uint8_t >(b.kind))
+                        );
+                        h = detail::hash_combine(h, std::hash< uint32_t >{}(b.outer_var_index));
+                        h = detail::hash_combine(h, std::hash< uint64_t >{}(b.structural_hash));
+                    }
+                    fp.payload_hash = h;
+                    fp.vars         = {};
+                } else if constexpr (std::is_same_v< T, CompetitionResolvedPayload >) {
+                    fp.payload_hash = std::hash< uint32_t >{}(payload.group_id);
+                    fp.vars         = {};
+                } else {
+                    // CandidatePayload
+                    size_t h = detail::hash_combine(
+                        std::hash< Expr >{}(*payload.expr),
+                        std::hash< bool >{}(payload.needs_original_space_verification)
+                    );
+                    fp.payload_hash = h;
+                    fp.vars         = payload.real_vars;
+                }
+            },
+            item.payload
+        );
+
+        return fp;
+    }
+
+    SemilinearFingerprintKey BuildSemilinearFingerprintKey(const SemilinearIR &ir) {
+        SemilinearFingerprintKey key;
+        key.constant = ir.constant;
+        key.bitwidth = ir.bitwidth;
+        key.terms.reserve(ir.terms.size());
+        for (const auto &t : ir.terms) {
+            const auto &info = ir.atom_table[t.atom_id];
+            key.terms.push_back(
+                {
+                    .coeff           = t.coeff,
+                    .support         = info.key.support,
+                    .truth_table     = info.key.truth_table,
+                    .structural_hash = info.structural_hash,
+                    .provenance      = info.provenance,
+                }
+            );
+        }
+        std::sort(key.terms.begin(), key.terms.end(), [](const auto &a, const auto &b) {
+            if (a.coeff != b.coeff) { return a.coeff < b.coeff; }
+            if (a.support != b.support) { return a.support < b.support; }
+            if (a.truth_table != b.truth_table) { return a.truth_table < b.truth_table; }
+            if (a.structural_hash != b.structural_hash) {
+                return a.structural_hash < b.structural_hash;
+            }
+            return static_cast< int >(a.provenance) < static_cast< int >(b.provenance);
+        });
+        return key;
+    }
+
+    namespace {
+        int BandOf(const WorkItem &item) {
+            auto kind = GetStateKind(item.payload);
+            if (kind == StateKind::kCandidateExpr || kind == StateKind::kCompetitionResolved) {
+                return 0;
+            }
+            // kSignatureCoeffState is non-candidate work
+            return 1;
+        }
+
+        // Sub-band within band 0: kCandidateExpr = 0, kCompetitionResolved = 1.
+        int SubBandOf(const WorkItem &item) {
+            auto kind = GetStateKind(item.payload);
+            if (kind == StateKind::kCandidateExpr) { return 0; }
+            if (kind == StateKind::kCompetitionResolved) { return 1; }
+            return 2;
+        }
+
+        bool IsBetterPriority(const WorkItem &a, const WorkItem &b) {
+            int band_a = BandOf(a);
+            int band_b = BandOf(b);
+            if (band_a != band_b) { return band_a < band_b; }
+            int sub_a = SubBandOf(a);
+            int sub_b = SubBandOf(b);
+            if (sub_a != sub_b) { return sub_a < sub_b; }
+            if (a.depth != b.depth) { return a.depth < b.depth; }
+            if (a.features.provenance != b.features.provenance) {
+                return a.features.provenance < b.features.provenance;
+            }
+            if (a.history.size() != b.history.size()) {
+                return a.history.size() < b.history.size();
+            }
+            return false;
+        }
+    } // namespace
+
+} // namespace cobra
+
+size_t
+std::hash< cobra::StateFingerprint >::operator()(const cobra::StateFingerprint &fp) const {
+    using cobra::detail::hash_combine;
+    size_t h = std::hash< uint64_t >{}(fp.payload_hash);
+    h        = hash_combine(h, std::hash< int >{}(static_cast< int >(fp.kind)));
+    h        = hash_combine(h, std::hash< uint32_t >{}(fp.bitwidth));
+    h        = hash_combine(h, std::hash< int >{}(static_cast< int >(fp.provenance)));
+    for (const auto &v : fp.vars) { h = hash_combine(h, std::hash< std::string >{}(v)); }
+    return h;
+}
+
+size_t std::hash< cobra::SemilinearFingerprintKey >::operator()(
+    const cobra::SemilinearFingerprintKey &key
+) const {
+    using cobra::detail::hash_combine;
+    size_t h = std::hash< uint64_t >{}(key.constant);
+    h        = hash_combine(h, std::hash< uint32_t >{}(key.bitwidth));
+    for (const auto &t : key.terms) {
+        h = hash_combine(h, std::hash< uint64_t >{}(t.coeff));
+        for (auto s : t.support) { h = hash_combine(h, std::hash< uint32_t >{}(s)); }
+        for (auto v : t.truth_table) { h = hash_combine(h, std::hash< uint64_t >{}(v)); }
+        h = hash_combine(h, std::hash< uint64_t >{}(t.structural_hash));
+        h = hash_combine(h, std::hash< int >{}(static_cast< int >(t.provenance)));
+    }
+    return h;
+}
+
+namespace cobra {
+
+    void PassAttemptCache::Record(const StateFingerprint &fp, PassId pass) {
+        cache_[fp] |= (uint64_t{ 1 } << static_cast< uint8_t >(pass));
+    }
+
+    bool PassAttemptCache::HasAttempted(const StateFingerprint &fp, PassId pass) const {
+        auto it = cache_.find(fp);
+        if (it == cache_.end()) { return false; }
+        return (it->second & (uint64_t{ 1 } << static_cast< uint8_t >(pass))) != 0;
+    }
+
+    void Worklist::Push(WorkItem item) {
+        items_.push_back(std::move(item));
+        high_water_ = std::max(high_water_, items_.size());
+    }
+
+    WorkItem Worklist::Pop() {
+        size_t best = 0;
+        for (size_t i = 1; i < items_.size(); ++i) {
+            if (IsBetterPriority(items_[i], items_[best])) { best = i; }
+        }
+        WorkItem result = std::move(items_[best]);
+        items_.erase(items_.begin() + static_cast< ptrdiff_t >(best));
+        return result;
+    }
+
+    bool Worklist::Empty() const { return items_.empty(); }
+
+    size_t Worklist::Size() const { return items_.size(); }
+
+    size_t Worklist::HighWaterMark() const { return high_water_; }
+
+    // ---------------------------------------------------------------
+    // SelectNextPass — DAG-aware priority scheduler
+    // ---------------------------------------------------------------
+
+    namespace {
+
+        bool IsSemilinearPass(PassId id) {
+            return id >= PassId::kSemilinearNormalize && id <= PassId::kSemilinearReconstruct;
+        }
+
+        struct FoldedAstPassEntry
+        {
+            PassId id;
+            uint64_t prereq_mask;
+            uint8_t priority;
+            bool is_structural_transform;
+        };
+
+        constexpr uint64_t Bit(PassId p) {
+            return static_cast< uint64_t >(1) << static_cast< uint8_t >(p);
+        }
+
+        constexpr FoldedAstPassEntry kFoldedAstPasses[] = {
+            {        PassId::kBuildSignatureState,                                0,  0, false },
+            {     PassId::kPrepareDirectRemainder,                                0,  1, false },
+            // Try the masked-product rewrite before direct product extraction
+            // can return the original encoding as a verified top-level winner.
+            {    PassId::kProductIdentityCollapse,                                0,  2,  true },
+            {         PassId::kExtractProductCore,                                0,  3, false },
+            {          PassId::kExtractPolyCoreD2,                                0,  4, false },
+            {        PassId::kExtractTemplateCore,                                0,  5, false },
+            {          PassId::kExtractPolyCoreD3,                                0,  6, false },
+            {          PassId::kExtractPolyCoreD4,                                0,  7, false },
+            {        PassId::kLiftArithmeticAtoms,                                0,  8, false },
+            { PassId::kLiftRepeatedSubexpressions,                                0,  9, false },
+            {            PassId::kOperandSimplify, Bit(PassId::kExtractProductCore), 10,  true },
+            {                PassId::kXorLowering,                                0, 11,  true },
+        };
+
+        struct ResidualPassEntry
+        {
+            PassId id;
+            uint64_t prereq_mask;
+            uint8_t priority;
+        };
+
+        // Direct boolean-null: ghost-first
+        constexpr ResidualPassEntry kDirectBooleanNullSolvers[] = {
+            {                  PassId::kResidualGhost, 0, 0 },
+            {          PassId::kResidualFactoredGhost, 0, 1 },
+            { PassId::kResidualFactoredGhostEscalated, 0, 2 },
+            {           PassId::kResidualPolyRecovery, 0, 3 },
+            {               PassId::kResidualTemplate, 0, 4 },
+        };
+
+        // Core-derived boolean-null: poly-first
+        constexpr ResidualPassEntry kCoreBooleanNullSolvers[] = {
+            {  PassId::kResidualPolyRecovery, 0, 0 },
+            {         PassId::kResidualGhost, 0, 1 },
+            { PassId::kResidualFactoredGhost, 0, 2 },
+            {      PassId::kResidualTemplate, 0, 3 },
+        };
+
+        // Core-derived standard: supported-first
+        constexpr ResidualPassEntry kCoreStandardSolvers[] = {
+            {    PassId::kResidualSupported, 0, 0 },
+            { PassId::kResidualPolyRecovery, 0, 1 },
+            {     PassId::kResidualTemplate, 0, 2 },
+        };
+
+    } // namespace
+
+    std::optional< PassId > SelectNextPass(
+        const WorkItem &item, const OrchestratorPolicy &policy, uint32_t verifications_used,
+        const PassAttemptCache &cache
+    ) {
+        auto kind = GetStateKind(item.payload);
+        auto fp   = ComputeFingerprint(item, 64);
+
+        // 1. Candidate → kVerifyCandidate
+        if (kind == StateKind::kCandidateExpr) {
+            auto pass = PassId::kVerifyCandidate;
+            if (verifications_used >= policy.max_candidates) { return std::nullopt; }
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 2. SignatureState → technique DAG passes
+        if (kind == StateKind::kSignatureState) {
+            static constexpr struct
+            {
+                PassId id;
+                uint8_t priority;
+            } kSignatureStatePasses[] = {
+                {         PassId::kSignaturePatternMatch, 0 },
+                {                  PassId::kSignatureAnf, 1 },
+                {             PassId::kPrepareCoeffModel, 2 },
+                { PassId::kSignatureMultivarPolyRecovery, 3 },
+                {     PassId::kSignatureBitwiseDecompose, 4 },
+                {      PassId::kSignatureHybridDecompose, 5 },
+            };
+
+            for (const auto &entry : kSignatureStatePasses) {
+                if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
+                if (cache.HasAttempted(fp, entry.id)) { continue; }
+                return entry.id;
+            }
+            return std::nullopt;
+        }
+
+        // 2b. SignatureCoeffState → technique pass table
+        if (kind == StateKind::kSignatureCoeffState) {
+            static constexpr struct
+            {
+                PassId id;
+                uint8_t priority;
+            } kSignatureCoeffPasses[] = {
+                {          PassId::kSignatureCobCandidate, 0 },
+                { PassId::kSignatureSingletonPolyRecovery, 1 },
+            };
+
+            for (const auto &entry : kSignatureCoeffPasses) {
+                if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
+                if (cache.HasAttempted(fp, entry.id)) { continue; }
+                return entry.id;
+            }
+            return std::nullopt;
+        }
+
+        // 3. CoreCandidate → kPrepareRemainderFromCore
+        if (kind == StateKind::kCoreCandidate) {
+            auto pass = PassId::kPrepareRemainderFromCore;
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 4. RemainderState → iterate residual solver table
+        if (kind == StateKind::kRemainderState) {
+            const auto &residual = std::get< RemainderStatePayload >(item.payload);
+
+            const ResidualPassEntry *table = nullptr;
+            size_t table_size              = 0;
+
+            if (residual.origin == RemainderOrigin::kDirectBooleanNull) {
+                table      = kDirectBooleanNullSolvers;
+                table_size = std::size(kDirectBooleanNullSolvers);
+            } else if (residual.is_boolean_null) {
+                table      = kCoreBooleanNullSolvers;
+                table_size = std::size(kCoreBooleanNullSolvers);
+            } else {
+                table      = kCoreStandardSolvers;
+                table_size = std::size(kCoreStandardSolvers);
+            }
+
+            for (size_t i = 0; i < table_size; ++i) {
+                const auto &entry = table[i];
+                if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
+                if (cache.HasAttempted(fp, entry.id)) { continue; }
+                return entry.id;
+            }
+            return std::nullopt;
+        }
+
+        // 5. SemilinearNormalizedIr → kSemilinearCheck
+        if (kind == StateKind::kSemilinearNormalizedIr) {
+            auto pass = PassId::kSemilinearCheck;
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 6. SemilinearCheckedIr → kSemilinearRewrite
+        if (kind == StateKind::kSemilinearCheckedIr) {
+            auto pass = PassId::kSemilinearRewrite;
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 7. SemilinearRewrittenIr → kSemilinearReconstruct
+        if (kind == StateKind::kSemilinearRewrittenIr) {
+            auto pass = PassId::kSemilinearReconstruct;
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 7b. CompetitionResolved → kResolveCompetition
+        if (kind == StateKind::kCompetitionResolved) {
+            auto pass = PassId::kResolveCompetition;
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 7c. LiftedSkeleton → kPrepareLiftedOuterSolve
+        if (kind == StateKind::kLiftedSkeleton) {
+            auto pass = PassId::kPrepareLiftedOuterSolve;
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 8. Semilinear routing: original OR rewritten-with-solve_ctx
+        {
+            bool eligible_semilinear = false;
+            if (item.features.provenance == Provenance::kOriginal
+                && item.features.classification
+                && item.features.classification->semantic == SemanticClass::kSemilinear)
+            {
+                eligible_semilinear = true;
+            } else if (
+                item.features.provenance == Provenance::kRewritten
+                && item.features.classification
+                && item.features.classification->semantic == SemanticClass::kSemilinear
+            )
+            {
+                if (auto *ast = std::get_if< AstPayload >(&item.payload)) {
+                    if (ast->solve_ctx.has_value()) { eligible_semilinear = true; }
+                }
+            }
+            if (eligible_semilinear) {
+                auto pass = PassId::kSemilinearNormalize;
+                if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+                if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+                return pass;
+            }
+            if (item.features.provenance == Provenance::kOriginal) { return std::nullopt; }
+        }
+
+        // 9. Non-original: must have classification and no unknown shape
+        if (!item.features.classification) { return std::nullopt; }
+        const auto &cls = *item.features.classification;
+        if (HasFlag(cls.flags, kSfHasUnknownShape)) { return std::nullopt; }
+
+        // 10. Non-exploration candidates → only kBuildSignatureState
+        if (!IsFoldedAstExplorationCandidate(cls.flags)) {
+            auto pass = PassId::kBuildSignatureState;
+            if ((item.attempted_mask & Bit(pass)) != 0) { return std::nullopt; }
+            if (cache.HasAttempted(fp, pass)) { return std::nullopt; }
+            return pass;
+        }
+
+        // 11. Exploration candidates → iterate the pass table
+        for (const auto &entry : kFoldedAstPasses) {
+            if ((item.attempted_mask & Bit(entry.id)) != 0) { continue; }
+            if ((item.attempted_mask & entry.prereq_mask) != entry.prereq_mask) { continue; }
+            if (entry.is_structural_transform && item.rewrite_gen >= policy.max_rewrite_gen) {
+                continue;
+            }
+            if (cache.HasAttempted(fp, entry.id)) { continue; }
+            return entry.id;
+        }
+
+        // 12. No eligible pass
+        return std::nullopt;
+    }
+
+    bool UnsupportedRankBetter(const UnsupportedCandidate &a, const UnsupportedCandidate &b) {
+        // 1. Candidates (verification-failed) rank highest
+        if (a.is_candidate_state != b.is_candidate_state) { return a.is_candidate_state; }
+        // 2. Deeper depth
+        if (a.depth != b.depth) { return a.depth > b.depth; }
+        // 3. More rewrites
+        if (a.rewrite_gen != b.rewrite_gen) { return a.rewrite_gen > b.rewrite_gen; }
+        // 4. More passes attempted
+        if (a.history_size != b.history_size) { return a.history_size > b.history_size; }
+        // 5. Last PassId enum order
+        if (a.last_pass != b.last_pass) { return a.last_pass > b.last_pass; }
+        // 6. Prefer items with structural transform terminal evidence
+        bool a_has_terminal = a.metadata.structural_transform_terminal.has_value();
+        bool b_has_terminal = b.metadata.structural_transform_terminal.has_value();
+        if (a_has_terminal != b_has_terminal) { return a_has_terminal; }
+        if (a_has_terminal && b_has_terminal) {
+            auto rank = [](ReasonCategory c) -> int {
+                if (c == ReasonCategory::kVerifyFailed) { return 2; }
+                if (c == ReasonCategory::kRepresentationGap) { return 1; }
+                return 0;
+            };
+            int ra = rank(a.metadata.structural_transform_terminal->category);
+            int rb = rank(b.metadata.structural_transform_terminal->category);
+            if (ra != rb) { return ra > rb; }
+        }
+        return false;
+    }
+
+    // ---------------------------------------------------------------
+    // Simplify — main orchestrator loop
+    // ---------------------------------------------------------------
+
+    namespace {
+
+        struct OrchestratorResult
+        {
+            PassOutcome outcome;
+            ItemMetadata metadata;
+            RunMetadata run_metadata;
+        };
+
+        std::optional< OrchestratorResult >
+        TryReducedPolynomialSeedOutcome(const WorkItem &sig_seed, OrchestratorContext &ctx) {
+            auto fast_candidate = TryReducedPolynomialFastPath(sig_seed, ctx);
+            if (!fast_candidate.has_value()) { return std::nullopt; }
+
+            if (fast_candidate->needs_original_space_verification) {
+                if (!ctx.evaluator) { return std::nullopt; }
+
+                auto check = internal::VerifyInOriginalSpace(
+                    *ctx.evaluator, ctx.original_vars, fast_candidate->real_vars,
+                    *fast_candidate->expr, ctx.bitwidth
+                );
+                if (!check.passed) { return std::nullopt; }
+
+                fast_candidate->verification = VerificationState::kVerified;
+                fast_candidate->needs_original_space_verification = false;
+            }
+
+            ItemMetadata meta;
+            meta.sig_vector   = fast_candidate->sig_vector;
+            meta.verification = fast_candidate->verification;
+
+            return OrchestratorResult{
+                .outcome = PassOutcome::Success(
+                    std::move(fast_candidate->expr), fast_candidate->real_vars,
+                    fast_candidate->verification
+                ),
+                .metadata     = std::move(meta),
+                .run_metadata = ctx.run_metadata,
+            };
+        }
+
+        // Seed the worklist for the no-AST path (signature only).
+        Result< std::optional< OrchestratorResult > > SeedNoAst(
+            const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
+            OrchestratorContext &ctx, Worklist &worklist
+        ) {
+            const auto num_vars = static_cast< uint32_t >(vars.size());
+
+            // Constant pruning: accept a constant match only when
+            // no evaluator is available or the evaluator confirms it
+            // at full width.  Dirac expressions (zero on {0,1} but
+            // nonzero at a single full-width point) would otherwise
+            // be emitted as constant 0 without any full-width check.
+            //
+            // Verification contract: the result is marked kVerified
+            // ONLY when an evaluator confirmed it at full width. With
+            // no evaluator (no-AST + opts.evaluator unset), we still
+            // accept the constant — it is correct on {0,1}^n by sig
+            // construction — but mark it kUnverified so the caller
+            // knows we never checked the full-width domain. Setting
+            // kVerified in the no-evaluator branch was the silent-
+            // accept bug: a Dirac sig would be emitted as Constant(0)
+            // with verified=true.
+            auto pm = MatchPattern(sig, num_vars, ctx.bitwidth);
+            if (pm && (*pm)->kind == Expr::Kind::kConstant) {
+                bool fw_ok       = true;
+                bool fw_verified = false;
+                if (ctx.evaluator) {
+                    auto check =
+                        FullWidthCheckEval(*ctx.evaluator, num_vars, **pm, ctx.bitwidth);
+                    fw_ok       = check.passed;
+                    fw_verified = check.passed;
+                }
+                if (fw_ok) {
+                    ItemMetadata meta;
+                    meta.sig_vector   = sig;
+                    meta.verification = fw_verified ? VerificationState::kVerified
+                                                    : VerificationState::kUnverified;
+
+                    return Ok(
+                        std::optional< OrchestratorResult >(OrchestratorResult{
+                            .outcome =
+                                PassOutcome::Success(std::move(*pm), {}, meta.verification),
+                            .metadata     = std::move(meta),
+                            .run_metadata = ctx.run_metadata,
+                        })
+                    );
+                }
+            }
+
+            // Eliminate auxiliary variables
+            auto elim                 = EliminateAuxVars(sig, vars);
+            const auto real_var_count = static_cast< uint32_t >(elim.real_vars.size());
+
+            if (real_var_count > ctx.opts.max_vars) {
+                return Err< std::optional< OrchestratorResult > >(
+                    CobraError::kTooManyVariables,
+                    "Variable count after elimination (" + std::to_string(real_var_count)
+                        + ") exceeds max_vars (" + std::to_string(ctx.opts.max_vars) + ")"
+                );
+            }
+
+            auto original_indices = BuildVarSupport(vars, elim.real_vars);
+
+            // Mirror RunBuildSignatureState: when an evaluator is
+            // available, downstream candidates MUST be lifted back to
+            // the original variable space and re-checked there
+            // (VerifyInOriginalSpace). Hardcoding this flag to false
+            // bypassed verification entirely on the no-AST seed path:
+            // a Dirac signature (zero on {0,1}^n, nonzero at full
+            // width) would round-trip as a verified Constant(0)
+            // because the boolean-domain AuxVarEliminator collapses
+            // real_vars to empty, the remapped evaluator pins all
+            // dropped vars to 0 (where the Dirac function also
+            // evaluates to 0), and the orchestrator accepted the
+            // candidate without consulting the original evaluator.
+            bool needs_verification = ctx.evaluator != nullptr;
+
+            WorkItem sig_seed;
+            sig_seed.payload = SignatureStatePayload{
+                .ctx = {
+                    .sig                               = sig,
+                    .real_vars                         = elim.real_vars,
+                    .elimination                       = std::move(elim),
+                    .original_indices                  = std::move(original_indices),
+                    .needs_original_space_verification = needs_verification,
+                },
+            };
+            sig_seed.features.provenance = Provenance::kOriginal;
+
+            if (auto fast_path = TryReducedPolynomialSeedOutcome(sig_seed, ctx)) {
+                return Ok(std::optional< OrchestratorResult >(std::move(*fast_path)));
+            }
+
+            auto group_id = CreateGroup(ctx.competition_groups, ctx.next_group_id);
+
+            auto sig_item     = std::move(sig_seed);
+            sig_item.group_id = group_id;
+            worklist.Push(std::move(sig_item));
+
+            return Ok(std::optional< OrchestratorResult >(std::nullopt));
+        }
+
+        // Seed the worklist for the with-AST path.
+        Result< std::optional< OrchestratorResult > >
+        SeedWithAst(const Expr &input_expr, OrchestratorContext &ctx, Worklist &worklist) {
+            // Create initial AST item, pre-simplifying small subexpressions
+            // via pattern-table lookup. This peels off MBA obfuscation layers
+            // (e.g., (X+Y+1)+(~X|~Y) → X|Y) before classification.
+            auto rewritten_ast = SimplifyPatternSubtrees(CloneExpr(input_expr), ctx.bitwidth);
+            WorkItem seed;
+            seed.payload = AstPayload{
+                .expr       = std::move(rewritten_ast),
+                .provenance = Provenance::kOriginal,
+            };
+            seed.features.provenance = Provenance::kOriginal;
+
+            // Prerequisite: lower NOT-over-arith
+            auto lower_result = RunLowerNotOverArith(seed, ctx);
+            if (!lower_result.has_value()) { return tl::make_unexpected(lower_result.error()); }
+
+            auto &lr = lower_result.value();
+
+            WorkItem *classify_target = nullptr;
+            std::optional< WorkItem > lowered_item;
+
+            if (lr.decision == PassDecision::kAdvance && !lr.next.empty()) {
+                lowered_item       = std::move(lr.next[0]);
+                classify_target    = &*lowered_item;
+                ctx.lowering_fired = true;
+            } else {
+                classify_target = &seed;
+            }
+
+            // Classify the target
+            auto cls_result = RunClassifyAst(*classify_target, ctx);
+            if (!cls_result.has_value()) { return tl::make_unexpected(cls_result.error()); }
+
+            auto &cr        = cls_result.value();
+            auto classified = std::move(cr.next[0]);
+            auto cls        = classified.features.classification;
+
+            // Copy classification to the original seed.
+            seed.features.classification = cls;
+            if (auto *ast = std::get_if< AstPayload >(&seed.payload)) {
+                ast->classification = cls;
+            }
+            // Push items to the worklist.
+            // Both branches ensure a kLowered item enters the worklist
+            // so the scheduler routes it into kBuildSignatureState.
+            if (lowered_item) {
+                // Lowering fired: classified item is already kLowered.
+                worklist.Push(std::move(classified));
+                // Push the original for the semilinear path.
+                worklist.Push(std::move(seed));
+            } else {
+                // Lowering was a no-op: promote to kLowered so the
+                // scheduler treats it identically to the lowered case.
+                if (auto *ast = std::get_if< AstPayload >(&classified.payload)) {
+                    ast->provenance = Provenance::kLowered;
+                }
+                classified.features.provenance = Provenance::kLowered;
+                worklist.Push(std::move(classified));
+                // Push the original for semilinear if applicable.
+                if (cls && cls->semantic == SemanticClass::kSemilinear) {
+                    worklist.Push(std::move(seed));
+                }
+            }
+
+            return Ok(std::optional< OrchestratorResult >(std::nullopt));
+        }
+
+        SimplifyOutcome ToSimplifyOutcome(
+            OrchestratorResult result, const Expr *original_expr,
+            const OrchestratorTelemetry &telemetry, uint32_t bitwidth,
+            const std::optional< ExprCost > &input_cost
+        ) {
+            SimplifyOutcome outcome;
+
+            if (result.outcome.Succeeded()) {
+                outcome.real_vars = result.outcome.RealVars();
+                // Read PassOutcome.Verification() instead of the parallel
+                // ItemMetadata.verification field. The two were initialized
+                // from the same source at every call site by convention; a
+                // future producer that stamps PassOutcome correctly but
+                // forgets the metadata field would otherwise see its
+                // verified rewrite reported as unverified. PassOutcome is
+                // the authoritative source for the success branch.
+                outcome.verified =
+                    result.outcome.Verification() == VerificationState::kVerified;
+                outcome.expr       = CleanupFinalExpr(result.outcome.TakeExpr(), bitwidth);
+                outcome.sig_vector = std::move(result.metadata.sig_vector);
+                outcome.kind       = SimplifyOutcome::Kind::kSimplified;
+
+                // Don't return a result that blows up relative to the input. A
+                // CoB-linear function (e.g. sum(xi) - xor(xi)) recovers an
+                // exponential AND-basis expansion that is correct but far larger
+                // than the already-minimal input; keep the input in that case.
+                // See IsCostBlowup for the ratio/floor rationale.
+                if (original_expr != nullptr && input_cost.has_value()) {
+                    const auto out_cost = ComputeCost(*outcome.expr).cost;
+                    if (IsCostBlowup(out_cost, *input_cost)) {
+                        outcome.kind = SimplifyOutcome::Kind::kUnchangedUnsupported;
+                        outcome.expr = CloneExpr(*original_expr);
+                        outcome.real_vars.clear();
+                        outcome.verified = false;
+                        // Stamp a structured reason so the unsupported result
+                        // still satisfies the has_structured_reason invariant
+                        // (set on result.metadata so the copy below propagates).
+                        result.metadata.reason_code =
+                            ReasonCode{ ReasonCategory::kCostRejected,
+                                        ReasonDomain::kOrchestrator, 0 };
+                    }
+                }
+            } else {
+                outcome.kind = SimplifyOutcome::Kind::kUnchangedUnsupported;
+                outcome.expr = original_expr != nullptr ? CloneExpr(*original_expr) : nullptr;
+            }
+
+            outcome.diag.classification = result.run_metadata.input_classification;
+            outcome.diag.structural_transform_rounds =
+                result.metadata.structural_transform_rounds;
+            outcome.diag.transform_produced_candidate =
+                result.metadata.transform_produced_candidate;
+            outcome.diag.candidate_failed_verification =
+                result.metadata.candidate_failed_verification;
+            outcome.diag.reason_code = result.metadata.reason_code;
+            outcome.diag.cause_chain = std::move(result.metadata.cause_chain);
+
+            if (!result.outcome.Succeeded()) {
+                outcome.diag.reason = result.outcome.Reason().top.message;
+            }
+
+            outcome.telemetry = {
+                .total_expansions    = telemetry.total_expansions,
+                .max_depth_reached   = telemetry.max_depth_reached,
+                .candidates_verified = telemetry.candidates_verified,
+                .queue_high_water    = telemetry.queue_high_water,
+            };
+
+            return outcome;
+        }
+
+    } // namespace
+
+    // Upper bound on the number of input variables the orchestrator
+    // will accept before any signature work runs. The sig pipeline is
+    // O(2^vars.size()) in both time and space (kLen = 1 << num_vars
+    // in EvaluateBooleanSignature, plus follow-on passes that walk
+    // the sig), so an unbounded vars.size() is a DoS vector — a
+    // caller can request 2^40 entries and OOM the process before any
+    // max_vars policy check fires (those checks happen on the
+    // post-AuxVarEliminator real_vars count, which presupposes the
+    // sig has already been computed). 24 caps the sig at ~16M
+    // entries (~128 MiB) which is well above the 6-8 vars used by
+    // the existing test corpus, the 20-var kMaxPolyVars ceiling, and
+    // the 16-var default opts.max_vars policy.
+    inline constexpr uint32_t kMaxInputVars = 24;
+
+    Result< SimplifyOutcome > Simplify(
+        const std::vector< uint64_t > &sig, const std::vector< std::string > &vars,
+        const Expr *input_expr, const Options &opts
+    ) {
+        COBRA_ZONE_N("Simplify");
+        COBRA_ZONE_VALUE(static_cast< int64_t >(vars.size()));
+
+        // Reject pathological input-variable counts before any
+        // 2^vars.size() signature allocation runs. Without this gate
+        // the with-AST path computes EvaluateBooleanSignature in
+        // RunBuildSignatureState (and the dynamic-mask shortcut just
+        // below) before reaching the post-elimination max_vars check,
+        // turning any caller-supplied vars.size() into an unbounded
+        // memory request.
+        if (vars.size() > kMaxInputVars) {
+            return Err< SimplifyOutcome >(
+                CobraError::kTooManyVariables,
+                "Input variable count (" + std::to_string(vars.size())
+                    + ") exceeds kMaxInputVars (" + std::to_string(kMaxInputVars)
+                    + "); a 2^vars.size() signature would exceed memory bounds. "
+                      "Reduce vars or pre-eliminate aux variables before calling Simplify."
+            );
+        }
+
+        // Reject malformed bitwidth at the public API boundary. bitwidth=0
+        // makes Bitmask(0) return 0, silently masking every evaluator's
+        // output to 0; bitwidth>64 has no meaningful interpretation in a
+        // 64-bit modular ring and triggers shift UB downstream.
+        if (opts.bitwidth == 0 || opts.bitwidth > 64) {
+            return Err< SimplifyOutcome >(
+                CobraError::kInvalidArgument,
+                "bitwidth must be in [1, 64]; got " + std::to_string(opts.bitwidth)
+            );
+        }
+
+        // Dynamic masking: if the root is (2^m - 1) & g and g contains
+        // no right shifts, try solving g under bitwidth=m. Modular
+        // arithmetic for {+, -, *, &, |, ^, ~} is homomorphic, so
+        // (2^m - 1) & f(x)|_{bw=64} = f(x)|_{bw=m}.
+        // The recursion is bounded because each accepted mask has
+        // effective_width < current bitwidth, so a 64-bit root can
+        // recurse only a handful of times before reaching 1 bit.
+        if (input_expr != nullptr) {
+            auto mask = DetectRootLowBitMask(*input_expr, opts.bitwidth);
+            if (mask.has_value() && !ContainsType(*mask->inner, Expr::Kind::kShr)) {
+                auto inner      = CloneExpr(*mask->inner);
+                uint32_t eff_bw = mask->effective_width;
+                auto inner_sig  = EvaluateBooleanSignature(
+                    *inner, static_cast< uint32_t >(vars.size()), eff_bw
+                );
+                Options inner_opts   = opts;
+                inner_opts.bitwidth  = eff_bw;
+                // Clear so the recursive Simplify builds a fresh
+                // evaluator from the inner expression at reduced
+                // bitwidth.  Evaluator{} evaluates to false via
+                // explicit operator bool().
+                inner_opts.evaluator = Evaluator{};
+                auto result          = Simplify(inner_sig, vars, inner.get(), inner_opts);
+                if (result.has_value() && result->kind == SimplifyOutcome::Kind::kSimplified) {
+                    auto wrapped = Expr::BitwiseAnd(
+                        std::move(result->expr), Expr::Constant(Bitmask(eff_bw))
+                    );
+                    auto eval  = Evaluator::FromExpr(*input_expr, opts.bitwidth);
+                    auto check = internal::VerifyInOriginalSpace(
+                        eval, vars, result->real_vars, *wrapped, opts.bitwidth
+                    );
+                    if (check.passed) {
+                        result->expr       = std::move(wrapped);
+                        result->sig_vector = EvaluateBooleanSignature(
+                            *result->expr, static_cast< uint32_t >(result->real_vars.size()),
+                            opts.bitwidth
+                        );
+                        result->verified = true;
+                        return result;
+                    }
+                }
+                // Mask reduction failed — fall through to full-width solve.
+            }
+        }
+
+        Options effective_opts = opts;
+        if (input_expr != nullptr && !opts.evaluator) {
+            effective_opts.evaluator = Evaluator::FromExpr(*input_expr, opts.bitwidth);
+        }
+        OrchestratorPolicy policy;
+        OrchestratorContext context{
+            .opts          = effective_opts,
+            .original_vars = vars,
+            .evaluator     = effective_opts.evaluator
+                ? std::make_shared< Evaluator >(
+                      effective_opts.evaluator.WithTrace(EvaluatorTraceKind::kRoot)
+                  )
+                : nullptr,
+            .bitwidth      = opts.bitwidth,
+            .run_metadata  = {},
+            .input_sig     = sig,
+        };
+
+        Worklist worklist;
+        OrchestratorTelemetry telemetry;
+
+        // Cost of the raw input, computed once and reused by every return path
+        // (the blow-up gate in ToSimplifyOutcome and the XOR exhaustion
+        // fallback). Absent when there is no input AST (sig-only path).
+        const std::optional< ExprCost > input_cost = input_expr
+            ? std::optional< ExprCost >(ComputeCost(*input_expr).cost)
+            : std::nullopt;
+
+        // Seeding
+        if (input_expr == nullptr) {
+            auto seed_result = SeedNoAst(sig, vars, context, worklist);
+            if (!seed_result.has_value()) { return tl::make_unexpected(seed_result.error()); }
+            if (seed_result.value().has_value()) {
+                return Ok(ToSimplifyOutcome(
+                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
+                    input_cost
+                ));
+            }
+        } else {
+            auto seed_result = SeedWithAst(*input_expr, context, worklist);
+            if (!seed_result.has_value()) { return tl::make_unexpected(seed_result.error()); }
+            if (seed_result.value().has_value()) {
+                return Ok(ToSimplifyOutcome(
+                    std::move(*seed_result.value()), input_expr, telemetry, context.bitwidth,
+                    input_cost
+                ));
+            }
+        }
+
+        // Build registry lookup map
+        const auto &registry = GetPassRegistry();
+        absl::flat_hash_map< PassId, const PassDescriptor * > registry_map;
+        for (const auto &desc : registry) { registry_map[desc.id] = &desc; }
+        PassAttemptCache cache;
+        uint32_t expansions    = 0;
+        uint32_t verifications = 0;
+        std::optional< UnsupportedCandidate > best_unsupported;
+        // Strongest structural-transform terminal observed across
+        // all lineages. Survives best_unsupported replacements.
+        std::optional< TransformTerminalSignal > strongest_transform_terminal;
+        auto make_unsupported_candidate = [](const WorkItem &work) -> UnsupportedCandidate {
+            return UnsupportedCandidate{
+                .metadata           = work.metadata,
+                .depth              = work.depth,
+                .rewrite_gen        = work.rewrite_gen,
+                .history_size       = static_cast< uint32_t >(work.history.size()),
+                .last_pass          = work.history.empty() ? PassId{} : work.history.back(),
+                .is_candidate_state = std::holds_alternative< CandidatePayload >(work.payload),
+            };
+        };
+
+        // Main loop
+        while (!worklist.Empty() && expansions < policy.max_expansions) {
+            auto item = worklist.Pop();
+            ++expansions;
+            telemetry.total_expansions  = expansions;
+            telemetry.max_depth_reached = std::max(telemetry.max_depth_reached, item.depth);
+
+            // Track best unsupported
+            bool current_was_best_snapshot = false;
+            auto current                   = make_unsupported_candidate(item);
+            if (!best_unsupported || UnsupportedRankBetter(current, *best_unsupported)) {
+                best_unsupported          = current;
+                current_was_best_snapshot = true;
+            }
+            auto refresh_best_unsupported = [&]() {
+                auto refreshed = make_unsupported_candidate(item);
+                if (current_was_best_snapshot || !best_unsupported
+                    || UnsupportedRankBetter(refreshed, *best_unsupported))
+                {
+                    best_unsupported = std::move(refreshed);
+                }
+            };
+            // Promote lineage-local terminal to loop-level tracker
+            if (item.metadata.structural_transform_terminal) {
+                auto &sig  = *item.metadata.structural_transform_terminal;
+                auto trank = [](ReasonCategory c) -> int {
+                    if (c == ReasonCategory::kVerifyFailed) { return 2; }
+                    if (c == ReasonCategory::kRepresentationGap) { return 1; }
+                    return 0;
+                };
+                if (!strongest_transform_terminal
+                    || trank(sig.category) > trank(strongest_transform_terminal->category))
+                {
+                    strongest_transform_terminal = sig;
+                }
+            }
+
+            // Candidate acceptance: verified candidates are immediately
+            // returned (top-level) or submitted into their owning group
+            // (lifted/grouped lineages).
+            if (auto *cand = std::get_if< CandidatePayload >(&item.payload)) {
+                if (!cand->needs_original_space_verification) {
+                    auto normalized_expr =
+                        NormalizeLateCandidateExpr(CloneExpr(*cand->expr), context.bitwidth);
+                    auto normalized_cost = ComputeCost(*normalized_expr).cost;
+
+                    // Stamp transform_produced_candidate if any rewrite
+                    // pass is in this candidate's lineage.
+                    for (auto h : item.history) {
+                        if (h == PassId::kOperandSimplify
+                            || h == PassId::kProductIdentityCollapse
+                            || h == PassId::kXorLowering)
+                        {
+                            item.metadata.transform_produced_candidate = true;
+                            break;
+                        }
+                    }
+
+                    // Grouped candidates: submit into owning group
+                    // so that the group's continuation can recombine.
+                    if (item.group_id.has_value()) {
+                        SubmitCandidate(
+                            context.competition_groups, *item.group_id,
+                            CandidateRecord{
+                                .expr                              = std::move(normalized_expr),
+                                .cost                              = normalized_cost,
+                                .verification                      = item.metadata.verification,
+                                .real_vars                         = cand->real_vars,
+                                .source_pass                       = cand->producing_pass,
+                                .needs_original_space_verification = false,
+                                .sig_vector                        = item.metadata.sig_vector,
+                            }
+                        );
+                        auto resolved =
+                            ReleaseHandle(context.competition_groups, *item.group_id);
+                        if (resolved.has_value()) { worklist.Push(std::move(*resolved)); }
+                        continue;
+                    }
+
+                    telemetry.queue_high_water =
+                        static_cast< uint32_t >(worklist.HighWaterMark());
+                    return Ok(ToSimplifyOutcome(
+                        OrchestratorResult{
+                            .outcome = PassOutcome::Success(
+                                std::move(normalized_expr), cand->real_vars,
+                                item.metadata.verification
+                            ),
+                            .metadata     = std::move(item.metadata),
+                            .run_metadata = context.run_metadata,
+                        },
+                        input_expr, telemetry, context.bitwidth, input_cost
+                    ));
+                }
+            }
+
+            // Select one pass
+            auto pass_id = SelectNextPass(item, policy, verifications, cache);
+            if (!pass_id) {
+                if (item.group_id.has_value()) {
+                    auto resolved = ReleaseHandle(context.competition_groups, *item.group_id);
+                    if (resolved.has_value()) { worklist.Push(std::move(*resolved)); }
+                }
+                continue;
+            }
+
+            // Compute pre-attempt fingerprint, record attempt
+            auto fp              = ComputeFingerprint(item, context.bitwidth);
+            item.attempted_mask |= Bit(*pass_id);
+            COBRA_TRACE(
+                "Orchestrator", "pass={} kind={} depth={} mask={:#x}",
+                static_cast< int >(*pass_id), static_cast< int >(GetStateKind(item.payload)),
+                item.depth, item.attempted_mask
+            );
+
+            // Run the pass
+            auto it = registry_map.find(*pass_id);
+            if (it == registry_map.end()) { continue; }
+            telemetry.passes_attempted.push_back(*pass_id);
+            auto result = [&]() {
+                COBRA_ZONE_N("RunPass");
+                COBRA_ZONE_VALUE(static_cast< int64_t >(*pass_id));
+                return it->second->run(item, context);
+            }();
+            if (*pass_id == PassId::kVerifyCandidate) {
+                ++verifications;
+                telemetry.candidates_verified = verifications;
+            }
+            if (!result.has_value()) { return tl::make_unexpected(result.error()); }
+            cache.Record(fp, *pass_id);
+
+            auto &pr = result.value();
+            COBRA_TRACE(
+                "Orchestrator", "  → decision={} children={} disp={}",
+                static_cast< int >(pr.decision), pr.next.size(),
+                static_cast< int >(pr.disposition)
+            );
+            if (pr.decision == PassDecision::kAdvance
+                || pr.decision == PassDecision::kSolvedCandidate)
+            {
+                // When lifting produces a skeleton, grant extra budget
+                // so the compact outer problem gets a fair exploration
+                // window instead of starving on the parent's depleted
+                // expansion counter.
+                if ((*pass_id == PassId::kLiftRepeatedSubexpressions
+                     || *pass_id == PassId::kLiftArithmeticAtoms)
+                    && !pr.next.empty())
+                {
+                    policy.max_expansions += policy.max_expansions / 2;
+                }
+                for (auto &next : pr.next) {
+                    next.depth = item.depth + 1;
+                    next.history.push_back(*pass_id);
+                    worklist.Push(std::move(next));
+                }
+                if (pr.disposition == ItemDisposition::kRetainCurrent) {
+                    item.depth = item.depth + 2;
+                    worklist.Push(std::move(item));
+                }
+                // CONTRACT (handle transfer on kConsumeCurrent + advance):
+                // Passes that return kAdvance / kSolvedCandidate +
+                // kConsumeCurrent on an item with item.group_id MUST
+                // transfer the handle. Three patterns are valid:
+                //   1. A child in pr.next inherits item.group_id
+                //      (e.g., RunClassifyAst). The child's lifecycle
+                //      eventually releases.
+                //   2. The pass stores item.group_id in a JoinState
+                //      (e.g., RunOperandSimplify, RunProductIdentity-
+                //      Collapse) so the matching Resolve* releases it.
+                //   3. The pass acquires a fresh handle on item.group_id
+                //      and stores it in a continuation, with the matching
+                //      resolver releasing.
+                // The main loop deliberately does NOT release here
+                // because doing so would break (1)–(3). Any new pass
+                // emitting kConsumeCurrent on a grouped item without
+                // one of these patterns LEAKS the parent group's
+                // handle, wedging that group permanently. The
+                // kBlocked/kNoProgress branch below DOES release
+                // because it has no transfer mechanism.
+            } else {
+                // kBlocked / kNoProgress
+                if (!pr.reason.top.message.empty()) { item.metadata.last_failure = pr.reason; }
+                // Accumulate technique failure into owning competition group
+                // so no-winner resolution produces deterministic diagnostics.
+                if (item.group_id.has_value() && !pr.reason.top.message.empty()) {
+                    auto git = context.competition_groups.find(*item.group_id);
+                    if (git != context.competition_groups.end()) {
+                        git->second.technique_failures.push_back(pr.reason);
+                    }
+                }
+                // XOR lowering terminal attribution (lineage-local)
+                if (*pass_id == PassId::kXorLowering) {
+                    auto cat = pr.reason.top.code.category;
+                    item.metadata.structural_transform_terminal =
+                        TransformTerminalSignal{ *pass_id, cat };
+                    if (cat == ReasonCategory::kRepresentationGap) {
+                        item.metadata.transform_produced_candidate = true;
+                    } else if (cat == ReasonCategory::kVerifyFailed) {
+                        item.metadata.transform_produced_candidate  = true;
+                        item.metadata.candidate_failed_verification = true;
+                    }
+                }
+                // Verify failure after XOR lowering (lineage-local)
+                if (*pass_id == PassId::kVerifyCandidate
+                    && pr.reason.top.code.category == ReasonCategory::kVerifyFailed)
+                {
+                    for (auto h : item.history) {
+                        if (h == PassId::kXorLowering) {
+                            item.metadata.structural_transform_terminal =
+                                TransformTerminalSignal{ PassId::kXorLowering,
+                                                         ReasonCategory::kVerifyFailed };
+                            item.metadata.transform_produced_candidate  = true;
+                            item.metadata.candidate_failed_verification = true;
+                            break;
+                        }
+                    }
+                }
+                // Accumulate decomposition cause chain
+                if (IsDecompositionFamilyPass(*pass_id)) {
+                    item.metadata.decomposition_causes.push_back(pr.reason.top);
+                    for (const auto &c : pr.reason.causes) {
+                        item.metadata.decomposition_causes.push_back(c);
+                    }
+                }
+                // Populate reason_code for consumed semilinear passes
+                if (IsSemilinearPass(*pass_id)
+                    && pr.reason.top.code.category != ReasonCategory::kNone)
+                {
+                    item.metadata.reason_code = pr.reason.top.code;
+                }
+                refresh_best_unsupported();
+                // Requeue if retained OR not-applicable (pass said "skip
+                // me" — the item should survive for subsequent passes).
+                if (pr.disposition == ItemDisposition::kRetainCurrent
+                    || pr.decision == PassDecision::kNotApplicable)
+                {
+                    worklist.Push(std::move(item));
+                } else if (item.group_id.has_value()) {
+                    // Item consumed — release its group handle so the
+                    // competition group can eventually resolve.
+                    auto resolved = ReleaseHandle(context.competition_groups, *item.group_id);
+                    if (resolved.has_value()) { worklist.Push(std::move(*resolved)); }
+                }
+            }
+        }
+
+        // Exhaustion: build the final unsupported result
+        ReasonDetail exhaustion_reason;
+        if (best_unsupported && !best_unsupported->metadata.last_failure.top.message.empty()) {
+            exhaustion_reason = best_unsupported->metadata.last_failure;
+        } else {
+            exhaustion_reason = ReasonDetail{
+                .top = { .code    = { ReasonCategory::kSearchExhausted,
+                                      ReasonDomain::kOrchestrator },
+                        .message = "Worklist exhausted" },
+            };
+        }
+
+        ItemMetadata final_meta =
+            best_unsupported ? std::move(best_unsupported->metadata) : ItemMetadata{};
+
+        // Derive structural-transform terminal reason code from
+        // lineage-local metadata instead of the old loop-global variable.
+        bool used_folded_ast_exploration =
+            IsFoldedAstExplorationCandidate(context.run_metadata.input_classification.flags)
+            || final_meta.structural_transform_rounds > 0
+            || final_meta.transform_produced_candidate
+            || strongest_transform_terminal.has_value();
+
+        if (used_folded_ast_exploration && !final_meta.reason_code.has_value()) {
+            if (strongest_transform_terminal) {
+                auto cat = strongest_transform_terminal->category;
+                final_meta.reason_code =
+                    ReasonCode{ cat, ReasonDomain::kStructuralTransform, 0 };
+                if (cat == ReasonCategory::kVerifyFailed) {
+                    final_meta.candidate_failed_verification = true;
+                    final_meta.transform_produced_candidate  = true;
+                } else if (cat == ReasonCategory::kRepresentationGap) {
+                    final_meta.transform_produced_candidate = true;
+                }
+            }
+        }
+
+        // Propagate reason_code from the last failure if not already set
+        if (!final_meta.reason_code.has_value()
+            && exhaustion_reason.top.code.category != ReasonCategory::kNone)
+        {
+            final_meta.reason_code = exhaustion_reason.top.code;
+        }
+
+        // Propagate accumulated decomposition cause chain
+        if (final_meta.cause_chain.empty() && !final_meta.decomposition_causes.empty()) {
+            final_meta.cause_chain = std::move(final_meta.decomposition_causes);
+        }
+        // For non-exploration inputs, propagate semilinear failure
+        // as the cause chain (matching legacy behavior where the
+        // supported pipeline's verification failure includes the
+        // semilinear pipeline's failure reason).
+        if (final_meta.cause_chain.empty()
+            && !IsFoldedAstExplorationCandidate(context.run_metadata.input_classification.flags)
+            && context.run_metadata.semilinear_failure.has_value())
+        {
+            const auto &sf = *context.run_metadata.semilinear_failure;
+            final_meta.cause_chain.push_back(sf.top);
+            for (const auto &c : sf.causes) { final_meta.cause_chain.push_back(c); }
+        }
+        // Fallback: collect cause chain from exhaustion reason
+        if (final_meta.cause_chain.empty() && !exhaustion_reason.causes.empty()) {
+            final_meta.cause_chain = exhaustion_reason.causes;
+        }
+
+        telemetry.queue_high_water = static_cast< uint32_t >(worklist.HighWaterMark());
+
+        // Exhaustion fallback: cancel structurally-repeated XOR operands in the
+        // raw input (T ^ T == 0, an EXACT identity at every bit width). When the
+        // survivors have a degenerate {0,1} signature, no signature/decomposition
+        // pass re-emits them, so the worklist exhausts even though the input
+        // collapses. Because this is exact (not a full-width approximation) the
+        // result is provably equivalent and sound to return directly. Fire only
+        // when it actually cancelled something and the result is strictly
+        // cheaper; the full-width check is defense in depth, not the proof.
+        if (input_expr != nullptr && context.evaluator
+            && ContainsType(*input_expr, Expr::Kind::kXor))
+        {
+            auto xor_peel = SimplifyXorChains(CloneExpr(*input_expr), context.bitwidth);
+            if (!ExprStructurallyEqual(*xor_peel, *input_expr)
+                && IsBetter(ComputeCost(*xor_peel).cost, *input_cost))
+            {
+                const auto num_vars = static_cast< uint32_t >(vars.size());
+                auto check          = FullWidthCheckEval(
+                    *context.evaluator, num_vars, *xor_peel, context.bitwidth
+                );
+                if (check.passed) {
+                    // This is a genuine (exact) simplification, not the
+                    // exhaustion failure final_meta was built to describe. Drop
+                    // the stale failure lineage so the kSimplified result does
+                    // not report a search-exhausted reason or cause chain.
+                    final_meta.reason_code.reset();
+                    final_meta.cause_chain.clear();
+                    final_meta.candidate_failed_verification = false;
+                    return Ok(ToSimplifyOutcome(
+                        OrchestratorResult{
+                            .outcome = PassOutcome::Success(
+                                std::move(xor_peel), vars, VerificationState::kVerified
+                            ),
+                            .metadata     = std::move(final_meta),
+                            .run_metadata = context.run_metadata,
+                        },
+                        input_expr, telemetry, context.bitwidth, input_cost
+                    ));
+                }
+            }
+        }
+
+        return Ok(ToSimplifyOutcome(
+            OrchestratorResult{
+                .outcome      = PassOutcome::Blocked(std::move(exhaustion_reason)),
+                .metadata     = std::move(final_meta),
+                .run_metadata = context.run_metadata,
+            },
+            input_expr, telemetry, context.bitwidth, input_cost
+        ));
+    }
+    // Явная инстанциация std::optional для Evaluator.
+    // MSVC 19.29 не генерирует конструктор копирования для std::optional<T>,
+    // когда T используется через косвенный include. Это заставляет компилятор
+    // создать все нужные методы в одном TU.
+    template class std::optional< Evaluator >;
+	template class std::optional< AstSolveContext >;
+	template class std::optional< SemilinearContext >;
+} // namespace cobra
+
+
+
