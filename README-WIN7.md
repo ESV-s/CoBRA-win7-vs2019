@@ -1,6 +1,20 @@
 # CoBRA на Windows 7 SP1 + Visual Studio 2019
 
-## Что изменено относительно оригинала (trailofbits/CoBRA)
+Рабочая сборка CoBRA (trailofbits/CoBRA) для Windows 7 SP1 с Visual Studio 2019.
+Проверено: `cobra-cli.exe` собирается и работает на Win7.
+
+## Версии зависимостей
+
+| Компонент | Версия | Откуда |
+|-----------|--------|--------|
+| **Abseil** | `20230125.0` | https://github.com/abseil/abseil-cpp/releases/tag/20230125.0 |
+| **Google Highway** | `1.0.7` | https://github.com/google/highway/releases/tag/1.0.7 |
+| **tl::expected** | master (single-header) | https://github.com/TartanLlama/expected |
+| **Visual Studio** | 2019 (MSVC 19.29.30147.0) | — |
+| **Windows SDK** | 8.1 (target 6.1.7601) | — |
+| **CMake** | 3.28 | — |
+
+## Что изменено относительно оригинала
 
 1. `std::expected` → `tl::expected` (backport C++23, single-header)
    - Файл `include/tl/expected.hpp` добавлен.
@@ -8,18 +22,24 @@
 2. `std::unreachable()` → `__assume(false)` (C++23 → MSVC 19.29)
    - `lib/core/BitPartitioner.cpp`, `ExprUtils.cpp`, `SemilinearIR.cpp`.
 3. `std::optional<Evaluator>` → `std::shared_ptr<Evaluator>` (обход бага линкера MSVC 19.29)
-   - `lib/core/Orchestrator.h`, `OrchestratorPasses.h`, `ContinuationTypes.h`, `JoinState.h`, `SignatureSimplifier.h` и все `.cpp`.
+   - `lib/core/Orchestrator.h`, `OrchestratorPasses.h`, `OrchestratorPasses.cpp`
+   - `lib/core/ContinuationTypes.h`, `JoinState.h`
+   - `include/cobra/core/SignatureSimplifier.h`
+   - `lib/core/Orchestrator.cpp`, `DecompositionEngine.cpp`, `DecompositionPasses.cpp`
+   - `lib/core/SemilinearPasses.cpp`, `SignaturePasses.cpp`, `LiftingPasses.cpp`
 4. `std::unexpected` → `tl::make_unexpected` в `Orchestrator.cpp`, `Result.h`.
 
-## Как собрать
+## Порядок сборки
 
-1. Abseil собрать с Windows SDK 8.1 (target 6.1.7601).
-2. Highway 1.0.7 собрать и установить.
-3. CoBRA собрать через CMake (`Visual Studio 16 2019`, x64, Release).
-4. `CMAKE_PREFIX_PATH` = `<путь к Abseil install>;<путь к Highway install>`.
+### 1. Abseil 20230125.0
 
-## Проверено
-
-- `cobra-cli.exe --mba "(x&y)+(x|y)"` → `x + y`
-- `cobra-cli.exe --mba "(x&0xFF)+(x&0xFF00)" --bitwidth 16` → `x`
-- Работает на Windows 7 SP1.
+```cmd
+cd D:\abseil-cpp-20230125.0
+mkdir build && cd build
+cmake -G "Visual Studio 16 2019" -A x64 ^
+  -DCMAKE_INSTALL_PREFIX=D:\abseil-install ^
+  -DCMAKE_CXX_STANDARD=17 ^
+  -DABSL_PROPAGATE_CXX_STD=ON ^
+  -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . --config Release
+cmake --install . --config Release
