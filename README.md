@@ -1,6 +1,6 @@
 # CoBRA
 
-**Co**efficient-**B**ased **R**econstruction of **A**rithmetic — a Mixed Boolean-Arithmetic expression simplifier.
+**Co**efficient-**B**ased **R**econstruction of **A**rithmetic — a Mixed Boolean-Arithmetic expression simplifier. https://github.com/trailofbits/CoBRA 
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
